@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Callable, Optional
 
 import numpy as np
@@ -36,84 +36,84 @@ class CellResult:
 
 
 class ThreadedMatrixMultiplier:
-    """Matrix multiplication with explicit Python worker threads and TensorFlow.
+    """Assign output cells to named Python workers.
 
-    Each output cell C[i, j] is assigned to a worker thread. Inside that worker,
-    each scalar multiplication A[i, k] * B[k, j] is executed with tf.multiply().
+    A worker calculates one C[row, column] entry at a time.  Its inner loop is
+    intentionally scalar and calls ``tf.multiply`` for every pair of elements.
     """
 
     def __init__(self, max_workers: Optional[int] = None, sample_every: int = 1000):
-        self.max_workers = max_workers or min(8, os.cpu_count() or 1)
+        available_cores = os.cpu_count() or 1
+        self.max_workers = max_workers or min(8, available_cores)
         self.sample_every = max(1, sample_every)
         self.unique_threads: set[str] = set()
         self.events: list[MultiplicationEvent] = []
-        self._lock = threading.Lock()
+        self._thread_set_lock = threading.Lock()
 
     @staticmethod
-    def validate_dimensions(a: np.ndarray, b: np.ndarray) -> None:
-        if a.ndim != 2 or b.ndim != 2:
-            raise ValueError("Both matrices must be 2-D.")
-        if a.shape[1] != b.shape[0]:
+    def validate_dimensions(left: np.ndarray, right: np.ndarray) -> None:
+        """Reject non-matrices and shapes that cannot be multiplied."""
+        if left.ndim != 2 or right.ndim != 2:
+            raise ValueError("Both inputs must be two-dimensional matrices.")
+        if left.shape[1] != right.shape[0]:
             raise ValueError(
-                f"Incompatible dimensions: A is {a.shape}, B is {b.shape}. "
-                "A columns must equal B rows."
+                f"Cannot multiply shapes {left.shape} and {right.shape}: "
+                "the left width must equal the right height."
             )
 
     def _worker_for_cell(
-        self,
-        a: np.ndarray,
-        b: np.ndarray,
-        i: int,
-        j: int,
+        self, left: np.ndarray, right: np.ndarray, row: int, column: int
     ) -> tuple[CellResult, list[MultiplicationEvent]]:
-        start = time.perf_counter()
-        thread_name = threading.current_thread().name
-        with self._lock:
-            self.unique_threads.add(thread_name)
+        """Calculate one output location and return its recorded real events."""
+        began = perf_counter()
+        worker_name = threading.current_thread().name
+        with self._thread_set_lock:
+            self.unique_threads.add(worker_name)
 
-        a_row = a[i]
-        b_col = b[:, j]
-        k_count = a.shape[1]
-        sampled_events: list[MultiplicationEvent] = []
-        cell_sum = 0.0
+        left_values = left[row]
+        right_values = right[:, column]
+        shared_count = left.shape[1]
+        output_width = right.shape[1]
+        accumulated_value = 0.0
+        captured_events: list[MultiplicationEvent] = []
 
-        for k in range(k_count):
-            # These are deliberately scalar operations performed inside the worker.
-            a_value = np.float32(a_row[k])
-            b_value = np.float32(b_col[k])
-            product_tensor = tf.multiply(a_value, b_value)
-            product_value = float(product_tensor.numpy())
-            cell_sum += product_value
+        for shared_index, (left_item, right_item) in enumerate(zip(left_values, right_values)):
+            # Keep the TensorFlow scalar operation inside the explicit worker.
+            left_scalar = np.float32(left_item)
+            right_scalar = np.float32(right_item)
+            scalar_product = float(tf.multiply(left_scalar, right_scalar).numpy())
+            accumulated_value += scalar_product
 
-            operation_index = (i * b.shape[1] * k_count) + (j * k_count) + k
-            # Preserve final cell values in the event stream for visualization.
-            if operation_index % self.sample_every == 0 or k == k_count - 1:
-                sampled_events.append(
+            linear_position = ((row * output_width) + column) * shared_count + shared_index
+            is_periodic_sample = linear_position % self.sample_every == 0
+            is_cell_completion = shared_index == shared_count - 1
+            if is_periodic_sample or is_cell_completion:
+                captured_events.append(
                     MultiplicationEvent(
-                        row=i,
-                        col=j,
-                        k=k,
-                        a_value=float(a_value),
-                        b_value=float(b_value),
-                        product=product_value,
-                        partial_sum=cell_sum,
-                        thread_name=thread_name,
-                        timestamp=time.perf_counter(),
-                        operation_index=operation_index,
+                        row=row,
+                        col=column,
+                        k=shared_index,
+                        a_value=float(left_scalar),
+                        b_value=float(right_scalar),
+                        product=scalar_product,
+                        partial_sum=accumulated_value,
+                        thread_name=worker_name,
+                        timestamp=perf_counter(),
+                        operation_index=linear_position,
                     )
                 )
 
-        elapsed = time.perf_counter() - start
+        duration = perf_counter() - began
         return (
             CellResult(
-                row=i,
-                col=j,
-                value=cell_sum,
-                thread_name=thread_name,
-                elapsed=elapsed,
-                scalar_multiplications=k_count,
+                row=row,
+                col=column,
+                value=accumulated_value,
+                thread_name=worker_name,
+                elapsed=duration,
+                scalar_multiplications=shared_count,
             ),
-            sampled_events,
+            captured_events,
         )
 
     def multiply(
@@ -122,44 +122,36 @@ class ThreadedMatrixMultiplier:
         b: tf.Tensor | np.ndarray,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> tuple[tf.Tensor, list[CellResult]]:
-        """Compute C = A x B using explicit worker threads.
+        """Return A x B using cell futures and TensorFlow scalar products."""
+        left = a.numpy() if isinstance(a, tf.Tensor) else np.asarray(a)
+        right = b.numpy() if isinstance(b, tf.Tensor) else np.asarray(b)
+        self.validate_dimensions(left, right)
 
-        The input matrices are converted to NumPy once before threading only to
-        avoid expensive TensorFlow tensor indexing inside the million-operation loop.
-        The actual scalar multiplication remains TensorFlow tf.multiply() inside
-        the worker threads.
-        """
-        a_np = a.numpy() if isinstance(a, tf.Tensor) else np.asarray(a)
-        b_np = b.numpy() if isinstance(b, tf.Tensor) else np.asarray(b)
-        self.validate_dimensions(a_np, b_np)
-
-        rows = a_np.shape[0]
-        cols = b_np.shape[1]
-        result = np.empty((rows, cols), dtype=np.float32)
-        cell_results: list[CellResult] = []
-        all_events: list[MultiplicationEvent] = []
-        completed = 0
+        row_count, column_count = left.shape[0], right.shape[1]
+        output = np.empty((row_count, column_count), dtype=np.float32)
+        completed_cells: list[CellResult] = []
+        recorded_events: list[MultiplicationEvent] = []
+        expected_cells = row_count * column_count
+        finished_cells = 0
 
         with ThreadPoolExecutor(
-            max_workers=self.max_workers,
-            thread_name_prefix="MatrixWorker",
+            max_workers=self.max_workers, thread_name_prefix="MatrixWorker"
         ) as executor:
-            futures = [
-                executor.submit(self._worker_for_cell, a_np, b_np, i, j)
-                for i in range(rows)
-                for j in range(cols)
+            submitted_cells = [
+                executor.submit(self._worker_for_cell, left, right, row, column)
+                for row in range(row_count)
+                for column in range(column_count)
             ]
+            for completed_future in as_completed(submitted_cells):
+                cell, cell_events = completed_future.result()
+                output[cell.row, cell.col] = cell.value
+                completed_cells.append(cell)
+                recorded_events.extend(cell_events)
+                finished_cells += 1
+                if progress_callback is not None:
+                    progress_callback(finished_cells, expected_cells)
 
-            for future in as_completed(futures):
-                cell, sampled_events = future.result()
-                result[cell.row, cell.col] = cell.value
-                cell_results.append(cell)
-                all_events.extend(sampled_events)
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, rows * cols)
-
-        cell_results.sort(key=lambda item: (item.row, item.col))
-        all_events.sort(key=lambda event: event.operation_index)
-        self.events = all_events
-        return tf.convert_to_tensor(result, dtype=tf.float32), cell_results
+        completed_cells.sort(key=lambda cell: (cell.row, cell.col))
+        recorded_events.sort(key=lambda event: event.operation_index)
+        self.events = recorded_events
+        return tf.convert_to_tensor(output, dtype=tf.float32), completed_cells
